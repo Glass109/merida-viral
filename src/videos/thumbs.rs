@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use super::http::client;
+use crate::http::shared_http_client;
 
 /// Cap on a downloaded thumbnail; anything larger is ignored.
 const MAX_BYTES: usize = 6 * 1024 * 1024;
@@ -11,7 +11,10 @@ const THUMB_DIR: &str = "public/thumbs";
 ///
 /// Returns the local public path (e.g. `/thumbs/12.jpg`), or `None` when the
 /// thumbnail is missing or the download fails.
-pub(crate) async fn cache(video_id: i64, remote: &str) -> Option<String> {
+pub(crate) async fn download_thumbnail_to_local_storage(
+    video_id: i64,
+    remote: &str,
+) -> Option<String> {
     if remote.is_empty() {
         return None;
     }
@@ -19,7 +22,7 @@ pub(crate) async fn cache(video_id: i64, remote: &str) -> Option<String> {
     if url.scheme() != "https" {
         return None;
     }
-    let response = client().get(url).send().await.ok()?;
+    let response = shared_http_client().get(url).send().await.ok()?;
     if !response.status().is_success()
         || response
             .content_length()

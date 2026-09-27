@@ -1,114 +1,142 @@
+use native_db::db_type::Error;
+
+use crate::db::{db, invalid_data, next_video_id, run_db};
+
 use super::model::{NewVideo, Video};
-use rusqlite::{Connection, params};
-use std::sync::{Mutex, OnceLock};
 
-static DB: OnceLock<Mutex<Connection>> = OnceLock::new();
-pub(crate) fn initialize() {
-    let _ = database();
-}
-fn database() -> &'static Mutex<Connection> {
-    DB.get_or_init(|| {
-        let conn = Connection::open("merida-viral.sqlite3").expect("open sqlite database");
-        conn.execute_batch("CREATE TABLE IF NOT EXISTS videos (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, creator TEXT NOT NULL, platform TEXT NOT NULL, url TEXT NOT NULL, lat REAL NOT NULL, lng REAL NOT NULL, neighborhood TEXT NOT NULL, thumbnail TEXT NOT NULL DEFAULT '', votes INTEGER NOT NULL DEFAULT 0);").expect("create videos table");
-        ensure_column(
-            &conn,
-            "thumbnail",
-            "ALTER TABLE videos ADD COLUMN thumbnail TEXT NOT NULL DEFAULT ''",
-        );
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM videos", [], |r| r.get(0)).unwrap_or(0);
-        if count == 0 {
-            let seeds = [
-                ("The little pink house you have to see", "@valeontheroad", "TikTok", "https://www.tiktok.com/", 20.9674, -89.6237, "Santa Ana", 248),
-                ("POV: you found the best marquesita", "@meridamunchies", "Instagram", "https://www.instagram.com/", 20.9751, -89.6169, "Centro", 186),
-                ("A slow morning in Mérida", "@sofiaslowdays", "Reels", "https://www.instagram.com/", 20.9812, -89.6290, "Santiago", 154),
-                ("Hidden courtyard café tour", "@yucatanlocals", "TikTok", "https://www.tiktok.com/", 20.9638, -89.6175, "La Mejorada", 121),
-                ("This sunset spot is unreal", "@diegowanders", "Reels", "https://www.instagram.com/", 20.9710, -89.6380, "Santa Lucía", 98),
-                ("Sunday market sounds", "@marisol.mx", "TikTok", "https://www.tiktok.com/", 20.9698, -89.6112, "San Sebastián", 77),
-            ];
-            for (title, creator, platform, url, lat, lng, area, votes) in seeds {
-                conn.execute("INSERT INTO videos (title,creator,platform,url,lat,lng,neighborhood,votes) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)", params![title,creator,platform,url,lat,lng,area,votes]).expect("seed videos");
-            }
+/// Newest first, or most votes first with newest as the tie breaker.
+pub(crate) async fn list_videos(newest: bool) -> Result<Vec<Video>, Error> {
+    run_db(move || {
+        let txn = db().r_transaction()?;
+        let mut videos: Vec<Video> = txn.scan().primary()?.all()?.collect::<Result<_, _>>()?;
+        if newest {
+            videos.sort_unstable_by_key(|video| std::cmp::Reverse(video.id));
+        } else {
+            videos.sort_unstable_by_key(|video| {
+                (std::cmp::Reverse(video.votes), std::cmp::Reverse(video.id))
+            });
         }
-        Mutex::new(conn)
+        Ok(videos)
     })
+    .await
 }
 
-/// Add a column to an existing database created before it existed.
-fn ensure_column(conn: &Connection, name: &str, ddl: &str) {
-    let present = conn
-        .prepare("PRAGMA table_info(videos)")
-        .and_then(|mut stmt| {
-            let names = stmt.query_map([], |row| row.get::<_, String>(1))?;
-            Ok(names
-                .filter_map(std::result::Result::ok)
-                .any(|col| col == name))
-        })
-        .unwrap_or(false);
-    if !present {
-        conn.execute_batch(ddl).expect("add videos column");
-    }
+pub(crate) async fn find_video(id: i64) -> Result<Option<Video>, Error> {
+    run_db(move || db().r_transaction()?.get().primary::<Video>(id)).await
 }
 
-pub(crate) fn list_videos(newest: bool) -> Vec<Video> {
-    let conn = database().lock().expect("database lock");
-    let sql = if newest {
-        "SELECT id,title,creator,platform,url,lat,lng,neighborhood,thumbnail,votes FROM videos ORDER BY id DESC"
-    } else {
-        "SELECT id,title,creator,platform,url,lat,lng,neighborhood,thumbnail,votes FROM videos ORDER BY votes DESC"
+/// Read and update in one write transaction so concurrent votes cannot be lost.
+pub(crate) async fn increment_vote(id: i64) -> Result<i64, Error> {
+    run_db(move || {
+        let txn = db().rw_transaction()?;
+        let old: Video = txn
+            .get()
+            .primary(id)?
+            .ok_or_else(|| invalid_data(format!("video {id} not found")))?;
+        let mut video = old.clone();
+        video.votes = video
+            .votes
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("vote count overflow"))?;
+        let votes = video.votes;
+        txn.update(old, video)?;
+        txn.commit()?;
+        Ok(votes)
+    })
+    .await
+}
+
+pub(crate) async fn create_video(input: &NewVideo) -> Result<i64, Error> {
+    let video = Video {
+        id: 0,
+        title: input.title.trim().to_owned(),
+        creator: input.creator.trim().to_owned(),
+        platform: input.platform.trim().to_owned(),
+        url: input.url.trim().to_owned(),
+        lat: input.lat,
+        lng: input.lng,
+        neighborhood: input.neighborhood.trim().to_owned(),
+        thumbnail: input.thumbnail.trim().to_owned(),
+        votes: 0,
     };
-    let mut stmt = conn.prepare(sql).expect("query videos");
-    stmt.query_map([], map_video)
-        .expect("read videos")
-        .filter_map(std::result::Result::ok)
-        .collect()
-}
-
-pub(crate) fn find_video(id: i64) -> Option<Video> {
-    let conn = database().lock().expect("database lock");
-    conn.query_row(
-        "SELECT id,title,creator,platform,url,lat,lng,neighborhood,thumbnail,votes FROM videos WHERE id=?1",
-        [id],
-        map_video,
-    )
-    .ok()
-}
-
-fn map_video(row: &rusqlite::Row<'_>) -> rusqlite::Result<Video> {
-    Ok(Video {
-        id: row.get(0)?,
-        title: row.get(1)?,
-        creator: row.get(2)?,
-        platform: row.get(3)?,
-        url: row.get(4)?,
-        lat: row.get(5)?,
-        lng: row.get(6)?,
-        neighborhood: row.get(7)?,
-        thumbnail: row.get(8)?,
-        votes: row.get(9)?,
+    run_db(move || {
+        let id = next_video_id()?;
+        let txn = db().rw_transaction()?;
+        txn.insert(Video { id, ..video })?;
+        txn.commit()?;
+        Ok(id)
     })
+    .await
 }
 
-pub(crate) fn increment_vote(id: i64) -> i64 {
-    let conn = database().lock().expect("database lock");
-    conn.execute("UPDATE videos SET votes=votes+1 WHERE id=?1", [id])
-        .expect("vote video");
-    conn.query_row("SELECT votes FROM videos WHERE id=?1", [id], |row| {
-        row.get(0)
+pub(crate) async fn set_thumbnail(id: i64, thumbnail: &str) -> Result<(), Error> {
+    let thumbnail = thumbnail.to_owned();
+    run_db(move || {
+        let txn = db().rw_transaction()?;
+        if let Some(old) = txn.get().primary::<Video>(id)? {
+            let mut video = old.clone();
+            video.thumbnail = thumbnail;
+            txn.update(old, video)?;
+        }
+        txn.commit()?;
+        Ok(())
     })
-    .expect("read updated vote count")
+    .await
 }
 
-pub(crate) fn create_video(input: &NewVideo) -> i64 {
-    let conn = database().lock().expect("database lock");
-    conn.execute("INSERT INTO videos (title,creator,platform,url,lat,lng,neighborhood,thumbnail) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)", params![input.title.trim(), input.creator.trim(), input.platform.trim(), input.url.trim(), input.lat, input.lng, input.neighborhood.trim(), input.thumbnail.trim()]).expect("save video");
-    conn.last_insert_rowid()
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-pub(crate) fn set_thumbnail(id: i64, thumbnail: &str) {
-    let conn = database().lock().expect("database lock");
-    conn.execute(
-        "UPDATE videos SET thumbnail=?2 WHERE id=?1",
-        params![id, thumbnail],
-    )
-    .expect("update thumbnail");
+    #[tokio::test]
+    async fn videos_round_trip_and_votes_are_atomic() {
+        crate::db::install_test_database();
+        let input = NewVideo {
+            title: " First ".into(),
+            creator: " Creator ".into(),
+            platform: "example".into(),
+            url: "https://example.com".into(),
+            lat: 20.0,
+            lng: -89.0,
+            neighborhood: " Centro ".into(),
+            thumbnail: "".into(),
+        };
+        let first = create_video(&input).await.unwrap();
+        let second = create_video(&input).await.unwrap();
+        assert_eq!((first, second), (1, 2));
+        assert_eq!(find_video(first).await.unwrap().unwrap().title, "First");
+        assert!(find_video(999).await.unwrap().is_none());
+
+        let votes = (0..16).map(|_| tokio::spawn(increment_vote(first)));
+        for vote in votes {
+            vote.await.unwrap().unwrap();
+        }
+        assert_eq!(find_video(first).await.unwrap().unwrap().votes, 16);
+        increment_vote(second).await.unwrap();
+        assert_eq!(
+            list_videos(true)
+                .await
+                .unwrap()
+                .iter()
+                .map(|video| video.id)
+                .collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+        assert_eq!(
+            list_videos(false)
+                .await
+                .unwrap()
+                .iter()
+                .map(|video| video.id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+
+        set_thumbnail(first, "local.jpg").await.unwrap();
+        assert_eq!(
+            find_video(first).await.unwrap().unwrap().thumbnail,
+            "local.jpg"
+        );
+        assert!(increment_vote(999).await.is_err());
+    }
 }

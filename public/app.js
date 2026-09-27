@@ -1,13 +1,4 @@
-const CENTER = [-89.62, 20.975];
-const map = new maplibregl.Map({
-  container: "map",
-  style: mvMap.styleFor(),
-  center: CENTER,
-  zoom: 14,
-  attributionControl: false,
-});
-map.addControl(new maplibregl.AttributionControl({ compact: true }));
-mvMap.setup(map);
+const map = mvMap.createMap("map");
 
 const mapView = document.querySelector("#map-view");
 const workspace = document.querySelector(".map-workspace");
@@ -18,7 +9,7 @@ const wideLayout = window.matchMedia("(min-width: 900px)");
 let markers = [];
 let popular = true;
 
-function showView(view, push = false) {
+function showPlacesOrMapView(view, push = false) {
   const showingMap = view === "map";
   workspace.dataset.view = view;
   viewToggle.setAttribute("aria-expanded", String(showingMap));
@@ -31,17 +22,19 @@ function showView(view, push = false) {
 }
 
 viewToggle.addEventListener("click", () => {
-  showView(workspace.dataset.view === "places" ? "map" : "places", true);
+  showPlacesOrMapView(workspace.dataset.view === "places" ? "map" : "places", true);
 });
-window.addEventListener("popstate", () => showView(location.hash === "#map" ? "map" : "places"));
+window.addEventListener("popstate", () => showPlacesOrMapView(location.hash === "#map" ? "map" : "places"));
 new ResizeObserver(() => {
   if (mapView.getBoundingClientRect().width) map.resize();
 }).observe(document.querySelector("#map"));
 
-function selectPlace(row) {
-  showView("map", !wideLayout.matches);
+function focusMapOnSelectedPlace(row) {
+  const coordinates = mvMap.coordinatesFromElement(row);
+  if (!coordinates) return;
+  showPlacesOrMapView("map", !wideLayout.matches);
   map.flyTo({
-    center: [+row.dataset.lng, +row.dataset.lat],
+    center: coordinates,
     zoom: 16,
     essential: true,
     animate: !window.matchMedia("(prefers-reduced-motion: reduce)").matches,
@@ -51,29 +44,14 @@ function selectPlace(row) {
   });
 }
 
-function syncMap() {
+function syncMapMarkersWithPlaceList() {
   markers.forEach((marker) => marker.remove());
-  markers = [];
-  grid.querySelectorAll(".place-row[data-lat][data-lng]").forEach((row, index) => {
-    const pin = document.createElement("button");
-    pin.type = "button";
-    pin.className = "map-pin" + (index === 0 ? " map-pin-hot" : "");
-    pin.setAttribute("aria-label", row.querySelector(".place-number").getAttribute("aria-label"));
-    pin.textContent = String(index + 1);
-    pin.addEventListener("click", () => selectPlace(row));
-    markers.push(
-      new maplibregl.Marker({ element: pin, anchor: "bottom" })
-        .setLngLat([+row.dataset.lng, +row.dataset.lat])
-        .addTo(map),
-    );
-    pin.setAttribute("aria-label", row.querySelector(".place-number").getAttribute("aria-label"));
-    row.querySelector(".place-number").addEventListener("click", () => selectPlace(row));
-  });
+  markers = mvMap.addNumberedPlaceMarkers(map, grid, focusMapOnSelectedPlace);
   document.querySelector("#video-count").textContent = String(markers.length).padStart(2, "0");
 }
 
 document.body.addEventListener("htmx:afterSwap", (event) => {
-  if (event.detail.target === grid) syncMap();
+  if (event.detail.target === grid) syncMapMarkersWithPlaceList();
 });
 document.body.addEventListener("htmx:configRequest", (event) => {
   if (!popular && event.detail.path === "/vote") event.detail.path = "/vote?sort=newest";
@@ -84,10 +62,12 @@ document.body.addEventListener("htmx:responseError", (event) => {
 
 sortToggle.addEventListener("click", () => {
   popular = !popular;
+  sortToggle.dataset.sort = popular ? "trending" : "newest";
   sortToggle.querySelector(".bar-label").textContent = popular
     ? sortToggle.dataset.trending
     : sortToggle.dataset.newest;
   sortToggle.setAttribute("aria-label", popular ? sortToggle.dataset.sortTrending : sortToggle.dataset.sortNewest);
+  sortToggle.setAttribute("aria-pressed", String(popular));
   htmx.ajax("GET", `/places?sort=${popular ? "popular" : "newest"}`, {
     target: "#video-grid",
     swap: "innerHTML",
@@ -109,5 +89,5 @@ document.querySelector("#locate").addEventListener("click", () => {
   );
 });
 
-showView(location.hash === "#map" ? "map" : "places");
-map.on("load", syncMap);
+showPlacesOrMapView(location.hash === "#map" ? "map" : "places");
+map.on("load", syncMapMarkersWithPlaceList);

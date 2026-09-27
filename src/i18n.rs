@@ -1,5 +1,5 @@
 use fluent_bundle::{FluentArgs, FluentBundle, FluentResource};
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 use topcoat::{
     context::Cx,
     router::{
@@ -21,14 +21,20 @@ pub(crate) struct Text {
     bundle: FluentBundle<&'static FluentResource>,
 }
 
-pub(crate) fn resource(language: Language) -> &'static FluentResource {
-    static EN: OnceLock<FluentResource> = OnceLock::new();
-    static ES: OnceLock<FluentResource> = OnceLock::new();
-    let (cell, source) = match language {
-        Language::En => (&EN, include_str!("locales/en.ftl")),
-        Language::Es => (&ES, include_str!("locales/es.ftl")),
-    };
-    cell.get_or_init(|| FluentResource::try_new(source.to_owned()).expect("valid Fluent resource"))
+static EN: LazyLock<FluentResource> = LazyLock::new(|| {
+    FluentResource::try_new(include_str!("locales/en.ftl").to_owned())
+        .expect("valid Fluent resource")
+});
+static ES: LazyLock<FluentResource> = LazyLock::new(|| {
+    FluentResource::try_new(include_str!("locales/es.ftl").to_owned())
+        .expect("valid Fluent resource")
+});
+
+pub(crate) fn fluent_resource_for_language(language: Language) -> &'static FluentResource {
+    match language {
+        Language::En => &EN,
+        Language::Es => &ES,
+    }
 }
 
 impl Text {
@@ -47,12 +53,12 @@ impl Text {
         .expect("valid locale");
         let mut bundle = FluentBundle::new(vec![id]);
         bundle
-            .add_resource(resource(language))
+            .add_resource(fluent_resource_for_language(language))
             .expect("unique Fluent messages");
         Self { language, bundle }
     }
 
-    pub(crate) fn lang(&self) -> &'static str {
+    pub(crate) fn language_tag(&self) -> &'static str {
         if self.language == Language::Es {
             "es"
         } else {
@@ -60,11 +66,11 @@ impl Text {
         }
     }
 
-    pub(crate) fn t(&self, key: &str) -> String {
-        self.with_args(key, None)
+    pub(crate) fn translate(&self, key: &str) -> String {
+        self.translate_with_args(key, None)
     }
 
-    pub(crate) fn with_args(&self, key: &str, args: Option<&FluentArgs<'_>>) -> String {
+    pub(crate) fn translate_with_args(&self, key: &str, args: Option<&FluentArgs<'_>>) -> String {
         let message = self
             .bundle
             .get_message(key)
@@ -132,8 +138,8 @@ mod tests {
 
     #[test]
     fn resources_parse_and_contain_matching_messages() {
-        let _ = resource(Language::En);
-        let _ = resource(Language::Es);
+        let _ = fluent_resource_for_language(Language::En);
+        let _ = fluent_resource_for_language(Language::Es);
         let keys = |source: &'static str| {
             source
                 .lines()
